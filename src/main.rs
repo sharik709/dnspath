@@ -5,12 +5,29 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::Command;
 
-use hickory_proto::op::{Message, Query};
+use hickory_proto::op::{Message, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
-use hickory_proto::serialize::binary::BinEncodable;
+
+use serde::Deserialize;
 
 use std::net::UdpSocket;
 use std::time::Duration;
+
+#[derive(Debug, Default)]
+struct Resolver {
+    domain: Option<String>,
+    nameservers: Vec<String>,
+    iface: Option<String>
+}
+
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Account {
+    name: String,
+    id: String,
+    tenant_id: String,
+}
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -18,6 +35,12 @@ fn main() {
     if args.len() != 3 {
         eprintln!("Usage: {} <name> <dns-server-ip>", args[0]);
         std::process::exit(2);
+    }
+
+    let json = az(&["account", "show"]).unwrap_or_default();
+    match serde_json::from_str::<Account>(&json) {
+        Ok(acc) => println!("azure: {} ({})", acc.name, acc.id),
+        Err(e) => println!("azure: could not parse account: {e}"),
     }
 
     let name: &str = &args[1];
@@ -55,37 +78,92 @@ fn main() {
         }
     }
 
-    println!("----TCP-----");
-    match TcpStream::connect_timeout(&server, Duration::from_secs(2)) {
-        Ok (mut stream) => {
-            stream.set_read_timeout(Some(Duration::from_secs(2))).expect("timeout");
-            let len = (packet.len() as u16).to_be_bytes();
-            stream.write_all(&len).expect("write len");
-            stream.write_all(&packet).expect("write packet");
-
-            let mut len_buf = [0u8; 2];
-            stream.read_exact(&mut len_buf).expect("read len");
-            let resp_len = u16::from_be_bytes(len_buf) as usize;
-
-            let mut resp_buf = vec![0u8; resp_len];
-            stream.read_exact(&mut resp_buf).expect("bad reply");
-            let resp = Message::from_vec(&resp_buf).expect("bad reply");
-            println!("rcode {}, {} answers", resp.response_code(), resp.answers().len())
-        },
-        Err(e) => println!("TCP connect failed: {e}")
-    }
-
     println!("------- OS resolver -------\n");
 
-    report("os resolver", &check_resolver(name, ip));
+    if !run("os resolver", check_resolver(name, ip)) { return; }
+    if !run("tunnel", check_tunnel(ip)) { return; }
+    let udp_ok = run("dns udp", check_dns_udp(&packet, server));
+    let tcp_ok = run("dns tcp", check_dns_tcp(&packet, server));
 
-    let route = match route_iface(ip) {
+    if !(udp_ok && tcp_ok) { return; }
+}
+
+fn az(args: &[&str]) -> Option<String> {
+    let out = Command::new("az")
+        .args(args)
+        .args(["-o", "json"])
+        .output()
+        .ok()?;
+
+    if !out.status.success() {
+        eprintln!("az {} failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn check_dns_udp(packet: &[u8], server: SocketAddr) -> Status {
+    judge(query_udp(packet, server), server)
+}
+
+fn check_dns_tcp(packet: &[u8], server: SocketAddr) -> Status {
+    judge(query_tcp(packet, server), server)
+}
+
+fn judge(resp: Option<Message>, server: SocketAddr) -> Status {
+    let Some(resp) = resp else {
+        return Status::Fail(format!("no reply from {server}"))
+    };
+
+    if resp.response_code() != ResponseCode::NoError {
+        return Status::Fail(format!("{server} answered {}", resp.response_code()));
+    }
+
+    let ips: Vec<_> = resp
+        .answers()
+        .iter()
+        .filter_map(|r| match r.data() {
+            Some(RData::A(a)) => Some(a.0),
+            _ => None,
+        })
+        .collect();
+
+    if ips.is_empty() {
+        Status::Fail("no A record in answer".to_string())
+    } else if ips.iter().all(|ip| ip.is_private()) {
+        Status::Pass(format!("{ips:?} (private)"))
+    } else {
+        Status::Fail(format!("{ips:?} includes a public IP"))
+    }
+}
+fn query_tcp(packet: &[u8], server: SocketAddr) -> Option<Message> {
+    println!("----TCP-----");
+    let mut stream = TcpStream::connect_timeout(&server, Duration::from_secs(2)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    let len = (packet.len() as u16).to_be_bytes();
+    stream.write_all(&len).ok()?;
+    stream.write_all(&packet).ok()?;
+
+    let mut len_buf = [0u8; 2];
+    stream.read_exact(&mut len_buf).ok()?;
+    let resp_len = u16::from_be_bytes(len_buf) as usize;
+
+    let mut resp_buf = vec![0u8; resp_len];
+    stream.read_exact(&mut resp_buf).ok()?;
+    Message::from_vec(&resp_buf).ok()
+}
+
+fn run(step: &str, status: Status) -> bool {
+    report(step, &status);
+    matches!(status, Status::Pass(_))
+}
+
+fn check_tunnel(ip: IpAddr) -> Status {
+    match route_iface(ip) {
         Some(iface) if iface.starts_with("utun") => Status::Pass(format!("{ip} via {iface}")),
         Some(iface) => Status::Fail(format!("{ip} via {iface}, not the VPN")),
         None => Status::Fail(format!("no route info for {ip}"))
-    };
-
-    report("tunnel", &route)
+    }
 }
 
 fn check_resolver(name: &str, expected: IpAddr) -> Status {
@@ -122,12 +200,6 @@ fn route_iface(ip: IpAddr) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
-#[derive(Debug, Default)]
-struct Resolver {
-    domain: Option<String>,
-    nameservers: Vec<String>,
-    iface: Option<String>
-}
 
 fn pick_resolver<'a>(list: &'a [Resolver], name: &str) -> Option<&'a Resolver> {
     let name = name.trim_end_matches('.');
